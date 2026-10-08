@@ -7,6 +7,7 @@ mod gameplay;
 mod item_use;
 mod prepared_settings;
 mod render;
+mod screens;
 mod world;
 
 /// Builds a tiny component with the same canonical imports as the guest SDK.

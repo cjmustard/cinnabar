@@ -17,6 +17,9 @@ use {
 };
 
 const COMPONENT_ENV: &str = "CINNABAR_MOD_COMPONENT";
+/// A mod package directory (`mod.toml`, `mod.wasm`, templates, textures); it takes precedence
+/// over a bare component.
+const PACKAGE_ENV: &str = "CINNABAR_MOD_PACKAGE";
 #[cfg(feature = "local-mods")]
 const PLAYERS_ENV: &str = "CINNABAR_MOD_PLAYERS";
 #[cfg(feature = "local-mods")]
@@ -79,17 +82,22 @@ struct ModRuntime {
     registration_identity: Option<[u8; 32]>,
     registration_request: Option<(u64, String)>,
     suspended: bool,
+    /// The screen owner's input and layout between frames, and which mod that is.
+    screens: screens::ScreenState,
 }
 
 /// Installs the developer extension only when its component path is explicit.
 pub(crate) fn configure_from_environment(app: &mut App) {
+    let package = std::env::var_os(PACKAGE_ENV);
     let path = std::env::var_os(COMPONENT_ENV);
     #[cfg(feature = "local-mods")]
     if let Some(set) = std::env::var_os(multi::SET_ENV) {
         match multi::read_set(Path::new(&set)) {
-            Ok(mods) => configure_set(app, mods),
+            Ok(mods) => configure_entries(app, mods),
             Err(error) => eprintln!("Local mod set disabled: {error}"),
         }
+    } else if let Some(package) = package.as_deref() {
+        configure_package(app, Path::new(package));
     } else if let Some(path) = path.as_deref() {
         configure(app, Some(Path::new(path)));
     } else {
@@ -105,16 +113,34 @@ pub(crate) fn configure_from_environment(app: &mut App) {
         }
     }
     #[cfg(not(feature = "local-mods"))]
-    if path.is_some() {
+    if package.is_some() || path.is_some() {
         let _ = app;
-        eprintln!("{COMPONENT_ENV} ignored: build bedrock-client with --features local-mods");
+        eprintln!(
+            "{PACKAGE_ENV} and {COMPONENT_ENV} ignored: build bedrock-client with --features local-mods"
+        );
     }
 }
 
 /// Loads one optional component without changing the vanilla schedule on absence.
 #[cfg(feature = "local-mods")]
 fn configure(app: &mut App, path: Option<&Path>) {
-    let grants = ModGrants {
+    configure_with_grants(app, path, environment_grants());
+}
+
+/// Loads one package with the developer profile: what its manifest asks for, plus the explicit
+/// opt-ins a bare component gets.
+#[cfg(feature = "local-mods")]
+fn configure_package(app: &mut App, dir: &Path) {
+    match ModHost::load_package(dir, environment_grants()) {
+        Ok(host) => install(app, vec![host]),
+        Err(error) => eprintln!("Cinnabar mod package {} disabled: {error:#}", dir.display()),
+    }
+}
+
+/// The grants a component or package selected on its own gets from the environment.
+#[cfg(feature = "local-mods")]
+fn environment_grants() -> ModGrants {
+    ModGrants {
         environment: true,
         players: std::env::var(PLAYERS_ENV).is_ok_and(|value| value == "1"),
         item_use: std::env::var(ITEM_USE_ENV).is_ok_and(|value| value == "1"),
@@ -138,8 +164,8 @@ fn configure(app: &mut App, path: Option<&Path>) {
             .unwrap_or_default(),
         packet_delay: std::env::var(PACKET_DELAY_ENV).is_ok_and(|value| value == "1")
             || std::env::var(PACKET_DELAY_VISUAL_ENV).is_ok_and(|value| value == "1"),
-    };
-    configure_with_grants(app, path, grants);
+        ..ModGrants::default()
+    }
 }
 
 /// Grants are explicit and apply only to the selected personal component.
@@ -153,13 +179,32 @@ fn configure_with_grants(app: &mut App, path: Option<&Path>, grants: ModGrants) 
 /// Loads components in order, each with its own grants; one failing to load leaves the rest.
 #[cfg(feature = "local-mods")]
 fn configure_set(app: &mut App, mods: Vec<(std::path::PathBuf, ModGrants)>) {
-    let mut hosts = mods.into_iter().filter_map(|(path, grants)| {
-        ModHost::load_with_grants(&path, grants)
+    let entries = mods
+        .into_iter()
+        .map(|(path, grants)| (multi::ModSource::Component(path), grants));
+    configure_entries(app, entries.collect());
+}
+
+/// Loads components and packages in order, each with its own grants; one failing to load
+/// leaves the rest.
+#[cfg(feature = "local-mods")]
+fn configure_entries(app: &mut App, mods: Vec<(multi::ModSource, ModGrants)>) {
+    let hosts = mods.into_iter().filter_map(|(source, grants)| {
+        source
+            .load(grants)
             .inspect_err(|error| {
-                eprintln!("Cinnabar extension {} disabled: {error:#}", path.display());
+                let path = source.path().display();
+                eprintln!("Cinnabar extension {path} disabled: {error:#}");
             })
             .ok()
     });
+    install(app, hosts.collect());
+}
+
+/// Installs loaded mods in load order; none installs nothing.
+#[cfg(feature = "local-mods")]
+fn install(app: &mut App, hosts: Vec<ModHost>) {
+    let mut hosts = hosts.into_iter();
     let Some(host) = hosts.next() else { return };
     let companions: Vec<_> = hosts.map(|host| multi::Companion { host }).collect();
     let controls = host.grants().controls
@@ -181,6 +226,7 @@ fn configure_set(app: &mut App, mods: Vec<(std::path::PathBuf, ModGrants)>) {
             registration_identity: None,
             registration_request: None,
             suspended: false,
+            screens: screens::ScreenState::default(),
         })
         .init_resource::<interaction::ModInteraction>();
     if controls && let Some(path) = std::env::var_os(font::FONT_ENV) {
@@ -267,6 +313,7 @@ fn drive_mod(
     watcher: Option<Res<registration::Watcher>>,
     render_scene: Option<ResMut<::render::ModRenderScene>>,
     mut outputs: ModOutputs,
+    mut screen_input: screens::ScreenInput,
 ) {
     let (Some(mut extension), Some(mut time_override), Some(mut interaction)) =
         (extension, time_override, interaction)
@@ -361,6 +408,22 @@ fn drive_mod(
         extension.host_mut(owner).set_panel_open(false);
     }
     presentation.set_mod_panel_open(extension.host(owner).panel_open());
+    let cursor = windows
+        .single()
+        .ok()
+        .and_then(|(window, _)| window.cursor_position())
+        .map(|point| point.to_array());
+    let menu_open = menu.as_deref().is_some_and(MenuRuntime::is_visible);
+    screens::drive(
+        &mut extension,
+        &player_runtime,
+        &ui,
+        &mut presentation,
+        menu.as_deref(),
+        cursor,
+        focused && !menu_open,
+        &mut screen_input,
+    );
 }
 
 /// Granted commands travel the session-fenced UI packet lane as vanilla command requests.
@@ -501,3 +564,5 @@ pub(crate) mod interaction;
 pub(crate) mod packet_delay;
 #[cfg(feature = "local-mods")]
 mod render;
+#[cfg(feature = "local-mods")]
+mod screens;

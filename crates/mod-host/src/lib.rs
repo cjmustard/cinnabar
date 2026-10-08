@@ -4,11 +4,20 @@ pub mod helper;
 #[cfg(feature = "execution")]
 mod load;
 #[cfg(feature = "execution")]
+pub mod package;
+#[cfg(feature = "execution")]
 mod runtime;
+#[cfg(feature = "execution")]
+mod screens;
 #[cfg(feature = "execution")]
 pub mod server;
 #[cfg(feature = "execution")]
 mod settings;
+
+#[cfg(feature = "execution")]
+pub use experience_sdk::mod_manifest::{KEY_NAMES, KeyDecl, Modifier};
+#[cfg(feature = "execution")]
+pub use screens::{DataSource, KeyModifiers, LoadedPackage, ModEvent, ModScreens};
 
 #[cfg(feature = "execution")]
 pub use mod_api::{
@@ -44,10 +53,10 @@ pub struct CameraDelta {
 }
 #[cfg(feature = "execution")]
 use {
-    anyhow::{Context, Result},
+    anyhow::Result,
     runtime::Instance,
-    sha2::{Digest, Sha256},
-    std::path::PathBuf,
+    server_experience::{screen::ScreenLayout, session_data::SessionData},
+    std::{path::PathBuf, sync::Arc},
     wasmtime::Engine,
 };
 
@@ -90,10 +99,25 @@ pub struct ModGrants {
     pub commands: Vec<String>,
     /// Allows bounded post-login packet delay through the private core endpoint.
     pub packet_delay: bool,
+    /// Allows a package's overlay and view beside the container screens.
+    pub screen: bool,
+    /// Allows reading the session's items.
+    pub items: bool,
+    /// Allows reading the session's recipes.
+    pub recipes: bool,
+    /// Allows delivering a package's declared keys.
+    pub keys: bool,
     /// Allows retained full-block highlights of matching loaded blocks.
     pub block_highlights: bool,
     /// Allows retained local fullbright lighting, without altering server light data.
     pub fullbright: bool,
+}
+
+/// Where a mod came from, which reload reads again.
+#[cfg(feature = "execution")]
+enum Source {
+    Component(PathBuf),
+    Package(PathBuf),
 }
 
 /// A developer-selected component with transactional reload and trap quarantine.
@@ -101,11 +125,14 @@ pub struct ModGrants {
 pub struct ModHost {
     engine: Engine,
     instance: Instance,
-    path: PathBuf,
+    source: Source,
     attempted: [u8; 32],
     grants: ModGrants,
     settings_writer: Option<settings::SettingsWriter>,
     settings_seed: Option<String>,
+    package: Option<LoadedPackage>,
+    layout: Option<ScreenLayout>,
+    session: Arc<SessionData>,
 }
 
 #[cfg(feature = "execution")]
@@ -252,26 +279,6 @@ impl ModHost {
     /// Whether this guest can still receive callbacks.
     pub fn is_active(&self) -> bool {
         self.instance.active
-    }
-
-    /// Replaces an instance only after changed bytes compile and initialize.
-    pub fn reload_if_changed(&mut self) -> Result<bool> {
-        let bytes = load::read_component(&self.path)?;
-        let digest = Sha256::digest(&bytes).into();
-        if self.attempted == digest {
-            return Ok(false);
-        }
-        self.attempted = digest;
-        let candidate = Instance::new(
-            &self.engine,
-            &bytes,
-            self.grants.clone(),
-            self.instance.settings().to_owned(),
-        )
-        .context("reload rejected; previous mod retained")?;
-        self.instance = candidate;
-        self.queue_settings();
-        Ok(true)
     }
 }
 
