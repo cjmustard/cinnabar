@@ -8,8 +8,8 @@ publish = false
 [features]
 tracy = ["bevy/trace", "dep:tracy-client"]
 publication-test-support = []
-# Compiles the hard-disabled Enhanced renderer.
-enhanced = []
+# Compiles the experimental Enhanced renderer; default builds keep it disabled.
+enhanced = ["render-model/enhanced"]
 
 [dependencies]
 tracy-client = { version = "=0.18.4", default-features = false, features = ["enable", "only-localhost", "ondemand"], optional = true }
