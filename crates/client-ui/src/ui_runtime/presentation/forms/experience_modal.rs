@@ -16,7 +16,7 @@ use server_experience::{
 };
 use ui::UiNode;
 
-use super::super::{FONT_DESIGN_PIXEL_TEXELS, TextMetrics, UiPresentationRuntime};
+use super::super::{FONT_DESIGN_PIXEL_TEXELS, IconRef, TextMetrics, UiPresentationRuntime};
 use super::{
     engine::{EngineInputs, EngineOutput, ScreenArt},
     hud::CachedScreen,
@@ -41,7 +41,14 @@ pub(super) struct ModalScreen {
     pages: Vec<render_model::UiTexturePage>,
     template: Option<String>,
     revision: Option<u64>,
+    /// The client part's values and rows at `revision`.
+    bound: DataSource,
+    /// `bound` with the player's inventory rows, which the engine reads.
     data: Arc<DataSource>,
+    /// The inventory and hotbar rows in `data`, and the icons their `#item_renderer_data`
+    /// index; empty when `data` needs them added.
+    rows: [Vec<CollectionItem>; 2],
+    icons: Vec<IconRef>,
     screen: CachedScreen,
     view: ViewState,
     /// The pointer in virtual pixels; the view sees it only when a control follows it.
@@ -59,6 +66,8 @@ pub(super) struct ModalScreen {
     reported: BTreeMap<String, String>,
     /// The control a secondary press went down on.
     secondary: Option<String>,
+    /// Each named scroll view's range last reported, by `scroll_view_name`.
+    scrolled: BTreeMap<String, screen::ScrollRange>,
 }
 
 /// What one frame of input did to the modal's edit boxes.
@@ -90,7 +99,10 @@ impl UiPresentationRuntime {
                 pages: Vec::new(),
                 template: None,
                 revision: None,
+                bound: DataSource::default(),
                 data: Arc::default(),
+                rows: Default::default(),
+                icons: Vec::new(),
                 screen: CachedScreen::default(),
                 view: ViewState::default(),
                 pointer: None,
@@ -101,6 +113,7 @@ impl UiPresentationRuntime {
                 pending_texts: Vec::new(),
                 reported: BTreeMap::new(),
                 secondary: None,
+                scrolled: BTreeMap::new(),
             });
         }
         let screen = slot.as_mut().expect("modal installed");
@@ -110,10 +123,12 @@ impl UiPresentationRuntime {
             screen.frame = None;
             screen.dispatcher = Dispatcher::default();
             screen.reported.clear();
+            screen.scrolled.clear();
         }
         if screen.revision != Some(modal.modal.revision) {
             screen.revision = Some(modal.modal.revision);
-            screen.data = Arc::new(data_source(modal.modal));
+            screen.bound = data_source(modal.modal);
+            screen.rows = Default::default();
             let mut texts: Vec<_> = modal
                 .modal
                 .texts
@@ -219,6 +234,39 @@ impl UiPresentationRuntime {
             screen.reported.insert(name.clone(), text.clone());
             out.edits.retain(|(control, _)| *control != name);
             out.edits.push((name, text));
+        }
+        out
+    }
+
+    /// Each scroll view with a `scroll_view_name` whose range changed since the last call, as
+    /// the last drawn frame laid it out: how far it is scrolled and its viewport's and content's
+    /// lengths, in GUI units. A view is reported when first drawn, then on each change.
+    pub fn experience_modal_scrolls(&mut self) -> Vec<(String, screen::ScrollRange)> {
+        let Some(screen) = self.form_presentation.experience_modal.as_mut() else {
+            return Vec::new();
+        };
+        let Some(frame) = &screen.frame else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, screen::ScrollRange)> = Vec::new();
+        for region in frame.hits.iter() {
+            let (HitKind::ScrollView, Some(name)) = (region.kind, &region.control_name) else {
+                continue;
+            };
+            let Some(metrics) = frame.report.scrolls.get(&region.key) else {
+                continue;
+            };
+            let range = screen::ScrollRange {
+                offset: metrics.offset,
+                viewport: metrics.viewport,
+                content: metrics.content,
+            };
+            if !range.valid() || screen.scrolled.get(name) == Some(&range) {
+                continue;
+            }
+            screen.scrolled.insert(name.clone(), range);
+            out.retain(|(view, _)| view != name);
+            out.push((name.clone(), range));
         }
         out
     }
@@ -360,8 +408,10 @@ impl UiPresentationRuntime {
 
     /// Draws the modal over the gameplay scenes when nothing else holds the screen; trusted
     /// chrome draws after it.
+    #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn append_experience_modal(
         &mut self,
+        player_runtime: &player_state::PlayerState,
         runtime: &UiRuntime,
         nodes: &mut Vec<UiNode>,
         next: &mut u32,
@@ -379,6 +429,20 @@ impl UiPresentationRuntime {
         let Some(template) = screen.template.clone().filter(|_| over_gameplay) else {
             return;
         };
+        // The player's inventory reads as vanilla's container screens bind it, replacing any
+        // client part rows of those names; the data is rebuilt only when a row changed.
+        let mut icons = Vec::new();
+        let rows =
+            super::containers::player_rows(player_runtime, runtime, &self.hud_frame, &mut icons);
+        if screen.rows != rows || screen.icons != icons {
+            let mut data = screen.bound.clone();
+            let [inventory, hotbar] = rows.clone();
+            data.set_collection("inventory_items", inventory);
+            data.set_collection("hotbar_items", hotbar);
+            screen.data = Arc::new(data);
+            screen.rows = rows;
+            screen.icons = icons;
+        }
         let catalog = screen
             .catalog
             .get_or_insert_with(|| modal_catalog(&renderer.pack_catalog_base(), &screen.files));
@@ -414,6 +478,7 @@ impl UiPresentationRuntime {
         };
         let px = metrics.scale.get() * FONT_DESIGN_PIXEL_TEXELS as f32;
         let art = ScreenArt {
+            icons: &screen.icons,
             view: Some(&screen.view),
             ..ScreenArt::default()
         };
